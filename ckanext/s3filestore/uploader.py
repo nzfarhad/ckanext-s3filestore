@@ -46,6 +46,7 @@ URL_HOST = re.compile('^https?://[^/]*/')
 VISIBILITY_CACHE_PATH = '/visibility'
 PUBLIC_ACL = 'public-read'
 PRIVATE_ACL = 'private'
+DEFAULT_ACL_CHECK = True  # Default to checking ACL support for backward compatibility
 
 
 def _get_underlying_file(wrapper):
@@ -107,27 +108,36 @@ class BaseS3Uploader(object):
         self.acl = config.get('ckanext.s3filestore.acl', PUBLIC_ACL)
         self.non_current_acl = config.get('ckanext.s3filestore.non_current_acl', PRIVATE_ACL)
         self.addressing_style = config.get('ckanext.s3filestore.addressing_style', 'auto')
+        # New configuration option to control ACL checking
+        self.check_acl_support = toolkit.asbool(config.get('ckanext.s3filestore.check_access_control_list', DEFAULT_ACL_CHECK))
+        
         # Fall back to standard endpoint if not specified.
-        # NB Boto will automatically add bucket name and key to the endpoint,
-        # according to the addressing style in use.
         self.host_name = config.get('ckanext.s3filestore.host_name',
                                     'https://s3.{}.amazonaws.com'.format(self.region))
         self.redis = RedisHelper()
         
-        # Check if bucket supports ACLs - do this once during initialization
+        # Initialize ACL support status
         self._supports_acl = None
-        try:
-            # Try to get bucket ACL - if it fails with AccessControlListNotSupported, we know ACLs are disabled
-            self.get_s3_client().get_bucket_acl(Bucket=self.bucket_name)
-            self._supports_acl = True
-            log.debug("S3 bucket '%s' supports ACLs", self.bucket_name)
-        except ClientError as e:
-            if e.response['Error']['Code'] == 'AccessControlListNotSupported':
-                self._supports_acl = False
-                log.info("S3 bucket '%s' has Object Ownership set to 'Bucket owner enforced' - ACLs disabled", self.bucket_name)
-            else:
-                # Other errors should be raised
-                raise
+        if self.check_acl_support:
+            try:
+                # Try to get bucket ACL - if it fails with AccessControlListNotSupported, we know ACLs are disabled
+                self.get_s3_client().get_bucket_acl(Bucket=self.bucket_name)
+                self._supports_acl = True
+                log.debug("S3 bucket '%s' supports ACLs", self.bucket_name)
+            except ClientError as e:
+                if e.response['Error']['Code'] == 'AccessControlListNotSupported':
+                    self._supports_acl = False
+                    log.info("S3 bucket '%s' has Object Ownership set to 'Bucket owner enforced' - ACLs disabled", self.bucket_name)
+                else:
+                    # Other errors should be raised
+                    raise
+        else:
+            self._supports_acl = False
+            log.info("ACL support check disabled by configuration - defaulting to bucket owner enforced mode")
+
+    def _should_use_acl(self):
+        """Helper method to determine if ACLs should be used"""
+        return self.check_acl_support and self._supports_acl
 
     def get_directory(self, id, storage_path):
         directory = os.path.join(storage_path, munge.munge_filename(id))
@@ -196,7 +206,7 @@ class BaseS3Uploader(object):
         log.debug(
             "ckanext.s3filestore.uploader: going to upload [%s] to bucket [%s] "
             "with access [%s] and mimetype [%s]",
-            filepath, self.bucket_name, acl, mime_type)
+            filepath, self.bucket_name, acl if self._should_use_acl() else 'bucket-owner-enforced', mime_type)
 
         try:
             kwargs = {
@@ -210,15 +220,15 @@ class BaseS3Uploader(object):
             if extra_metadata:
                 kwargs['Metadata'] = extra_metadata
                 
-            # Only add ACL if bucket supports it
-            if self._supports_acl:
+            # Only add ACL if enabled and supported
+            if self._should_use_acl():
                 kwargs['ACL'] = acl
 
             self.get_s3_resource().Object(self.bucket_name, filepath).put(**kwargs)
             log.info("Successfully uploaded %s to S3!", filepath)
             
             # Update cache only if we're tracking ACLs
-            if self._supports_acl:
+            if self._should_use_acl():
                 self.redis.delete(filepath)
                 self.redis.delete(filepath + VISIBILITY_CACHE_PATH + '/all')
                 self.redis.put(filepath + VISIBILITY_CACHE_PATH, acl, expiry=self.acl_cache_window)
@@ -241,6 +251,10 @@ class BaseS3Uploader(object):
         ''' Check whether an S3 object key is publicly readable.
         May cache results to reduce API calls.
         '''
+        # If ACLs are disabled or not supported, access is controlled by bucket policy
+        if not self._should_use_acl():
+            return False  # When ACLs disabled, rely on bucket policy for access control
+            
         acl_key = key + VISIBILITY_CACHE_PATH
         acl = self.redis.get(acl_key)
         if acl == PUBLIC_ACL:
@@ -248,15 +262,22 @@ class BaseS3Uploader(object):
         if acl == PRIVATE_ACL:
             return False
 
-        client = self.get_s3_client()
-        # check if the object ACL grants any permission to all users
-        acl = PUBLIC_ACL if any(
-            grant['Grantee']['Type'] == 'Group'
-            and grant['Grantee'].get('URI', '').endswith('AllUsers')
-            for grant in client.get_object_acl(Bucket=self.bucket_name, Key=key)['Grants']
-        ) else PRIVATE_ACL
-        self.redis.put(acl_key, acl, expiry=self.acl_cache_window)
-        return acl == PUBLIC_ACL
+        try:
+            client = self.get_s3_client()
+            # check if the object ACL grants any permission to all users
+            acl = PUBLIC_ACL if any(
+                grant['Grantee']['Type'] == 'Group'
+                and grant['Grantee'].get('URI', '').endswith('AllUsers')
+                for grant in client.get_object_acl(Bucket=self.bucket_name, Key=key)['Grants']
+            ) else PRIVATE_ACL
+            self.redis.put(acl_key, acl, expiry=self.acl_cache_window)
+            return acl == PUBLIC_ACL
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'AccessControlListNotSupported':
+                # If we get here, our initial ACL support check was wrong
+                self._supports_acl = False
+                return False
+            raise e
 
     def get_signed_url_to_key(self, key, extra_params={}):
         '''Generates a pre-signed URL giving access to an S3 object,
@@ -629,8 +650,10 @@ class S3ResourceUploader(BaseS3Uploader):
         ''' Update the visibility of all S3 objects for a resource
         to match the package, if the ACL config is set to 'auto'.
         '''
-        if self.acl != 'auto':
+        # Skip if ACLs are not enabled/supported or not auto
+        if not self._should_use_acl() or self.acl != 'auto':
             return
+            
         if not target_acl:
             target_acl = self._get_target_acl(id)
 
@@ -641,6 +664,7 @@ class S3ResourceUploader(BaseS3Uploader):
         if all_visibility is not None and all_visibility == target_acl:
             log.debug("update_visibility: id: %s already set and found in cache as %s", id, target_acl)
             return
+        
         # iterate through every S3 object matching the resource ID
         log.debug("update_visibility: id: %s getting item list from store", id)
         resource_objects = client.list_objects_v2(
@@ -651,29 +675,44 @@ class S3ResourceUploader(BaseS3Uploader):
         if not resource_objects['KeyCount']:
             return
 
-        for upload in resource_objects['Contents']:
-            upload_key = upload['Key']
-            log.debug("Setting visibility for key [%s], current object is [%s]", upload_key, current_key)
-            if upload_key == current_key:
-                acl = target_acl
-            elif self.delete_non_current_days >= 0 and _get_object_age_days(upload) >= self.delete_non_current_days:
-                self.clear_key(upload_key)
-                continue
-            elif self.non_current_acl == 'auto':
-                acl = target_acl
-            else:
-                acl = self.non_current_acl
+        try:
+            for upload in resource_objects['Contents']:
+                upload_key = upload['Key']
+                log.debug("Setting visibility for key [%s], current object is [%s]", upload_key, current_key)
+                if upload_key == current_key:
+                    acl = target_acl
+                elif self.delete_non_current_days >= 0 and _get_object_age_days(upload) >= self.delete_non_current_days:
+                    self.clear_key(upload_key)
+                    continue
+                elif self.non_current_acl == 'auto':
+                    acl = target_acl
+                else:
+                    acl = self.non_current_acl
 
-            is_public_read = self.is_key_public(upload_key)
-            # if the ACL status doesn't match what we want, update it
-            if (acl == PUBLIC_ACL) != is_public_read:
-                log.debug("Updating ACL for object %s to %s", upload_key, acl)
-                client.put_object_acl(
-                    Bucket=self.bucket_name, Key=upload_key, ACL=acl)
-                # Drop the cached URL since it will likely need to change
-                self.redis.delete(upload_key)
-                self.redis.put(upload_key + VISIBILITY_CACHE_PATH, acl, expiry=self.acl_cache_window)
-        self.redis.put(current_key + VISIBILITY_CACHE_PATH + '/all', target_acl, expiry=self.acl_cache_window)
+                is_public_read = self.is_key_public(upload_key)
+                # if the ACL status doesn't match what we want, update it
+                if (acl == PUBLIC_ACL) != is_public_read:
+                    log.debug("Updating ACL for object %s to %s", upload_key, acl)
+                    try:
+                        client.put_object_acl(
+                            Bucket=self.bucket_name, Key=upload_key, ACL=acl)
+                        # Drop the cached URL since it will likely need to change
+                        self.redis.delete(upload_key)
+                        self.redis.put(upload_key + VISIBILITY_CACHE_PATH, acl, expiry=self.acl_cache_window)
+                    except ClientError as e:
+                        if e.response['Error']['Code'] == 'AccessControlListNotSupported':
+                            # If we get here, our initial ACL support check was wrong
+                            self._supports_acl = False
+                            return
+                        raise e
+                        
+            self.redis.put(current_key + VISIBILITY_CACHE_PATH + '/all', target_acl, expiry=self.acl_cache_window)
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'AccessControlListNotSupported':
+                # If we get here, our initial ACL support check was wrong
+                self._supports_acl = False
+                return
+            raise e
 
     def upload(self, id, max_size=10):
         '''Upload the file to S3.'''

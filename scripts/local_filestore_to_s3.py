@@ -15,8 +15,10 @@ import os
 from sqlalchemy import create_engine
 from sqlalchemy.sql import text
 import boto3
+from botocore.exceptions import ClientError
 
 import configparser
+import ckan.plugins.toolkit as toolkit
 
 # Configuration
 
@@ -37,7 +39,8 @@ else:
 AWS_BUCKET_NAME = main_config.get('ckanext.s3filestore.aws_bucket_name', 'my-bucket')
 AWS_STORAGE_PATH = ''
 AWS_S3_ACL = main_config.get('ckanext.s3filestore.acl', 'public-read')
-
+AWS_REGION_NAME = main_config.get('ckanext.s3filestore.aws_region_name', 'us-east-1')
+AWS_CHECK_ACL = toolkit.asbool(main_config.get('ckanext.s3filestore.check_access_control_list', True))
 
 resource_ids_and_paths = {}
 
@@ -73,19 +76,45 @@ finally:
 print('{0} resources matched on the database'.format(
     len(resource_ids_and_names.keys())))
 
-# todo: move to plugin initi so we don't need to reinit secrets
-s3_connection = boto3.resource('s3', aws_access_key_id=AWS_ACCESS_KEY_ID, aws_secret_access_key=AWS_SECRET_ACCESS_KEY)
-bucket = s3_connection.Bucket(AWS_BUCKET_NAME)
+def check_acl_support(s3_connection, bucket_name):
+    if not AWS_CHECK_ACL:
+        print("ACL support check disabled by configuration - defaulting to bucket owner enforced mode")
+        return False
+        
+    try:
+        s3_connection.get_bucket_acl(Bucket=bucket_name)
+        print("S3 bucket supports ACLs")
+        return True
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'AccessControlListNotSupported':
+            print("Warning: Bucket has Object Ownership set to 'Bucket owner enforced' - ACLs disabled")
+            return False
+        raise e
 
-uploaded_resources = []
-for resource_id, file_name in resource_ids_and_names.iteritems():
-    key = 'resources/{resource_id}/{file_name}'.format(
-        resource_id=resource_id, file_name=file_name)
-    if AWS_STORAGE_PATH:
-        key = AWS_STORAGE_PATH + '/' + key
+def main():
+    s3_connection = boto3.client('s3',
+                              aws_access_key_id=AWS_ACCESS_KEY_ID,
+                              aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+                              region_name=AWS_REGION_NAME)
+                              
+    supports_acl = check_acl_support(s3_connection, AWS_BUCKET_NAME)
+    
+    for resource_id in resource_ids_and_paths:
+        key = resource_ids_and_paths[resource_id]
+        print('Uploading {0} to S3...'.format(key))
+        try:
+            kwargs = {
+                'Bucket': AWS_BUCKET_NAME,
+                'Key': key,
+                'Body': open(resource_ids_and_paths[resource_id], 'rb')  # Use binary mode for safety
+            }
+            if supports_acl:
+                kwargs['ACL'] = AWS_S3_ACL
+            s3_connection.put_object(**kwargs)
+            print('Finished uploading {0} to S3'.format(key))
+        except Exception as e:
+            print('Error uploading {0} to S3: {1}'.format(key, e))
+            continue
 
-    s3_connection.Object(AWS_BUCKET_NAME, key).put(Body=open(resource_ids_and_paths[resource_id]), ACL=AWS_S3_ACL)
-    uploaded_resources.append(resource_id)
-    print('Uploaded resource {0} ({1}) to S3'.format(resource_id, file_name))
-
-print('Done, uploaded {0} resources to S3'.format(len(uploaded_resources)))
+if __name__ == "__main__":
+    main()

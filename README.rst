@@ -90,6 +90,13 @@ Optional::
     # Default 'public-read'.
     ckanext.s3filestore.acl = private
 
+    # An optional setting to control whether to check for ACL support on the bucket.
+    # When set to false, the system will default to bucket owner enforced mode
+    # and not attempt to set ACLs on objects. This is recommended when using
+    # buckets with Object Ownership set to 'Bucket owner enforced'.
+    # Default is true (for backward compatibility).
+    ckanext.s3filestore.check_access_control_list = false
+
     # An optional setting to change the ACL of files previously uploaded
     # for the resource under different names.
     # 'auto' means use the same visibility as the current version.

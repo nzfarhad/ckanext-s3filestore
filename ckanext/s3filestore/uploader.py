@@ -113,6 +113,21 @@ class BaseS3Uploader(object):
         self.host_name = config.get('ckanext.s3filestore.host_name',
                                     'https://s3.{}.amazonaws.com'.format(self.region))
         self.redis = RedisHelper()
+        
+        # Check if bucket supports ACLs - do this once during initialization
+        self._supports_acl = None
+        try:
+            # Try to get bucket ACL - if it fails with AccessControlListNotSupported, we know ACLs are disabled
+            self.get_s3_client().get_bucket_acl(Bucket=self.bucket_name)
+            self._supports_acl = True
+            log.debug("S3 bucket '%s' supports ACLs", self.bucket_name)
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'AccessControlListNotSupported':
+                self._supports_acl = False
+                log.info("S3 bucket '%s' has Object Ownership set to 'Bucket owner enforced' - ACLs disabled", self.bucket_name)
+            else:
+                # Other errors should be raised
+                raise
 
     def get_directory(self, id, storage_path):
         directory = os.path.join(storage_path, munge.munge_filename(id))
@@ -188,29 +203,26 @@ class BaseS3Uploader(object):
                 'Body': upload_file.read(),
                 'ContentType': mime_type
             }
-            
-            # Only add ACL if not using bucket owner enforced
-            try:
-                kwargs['ACL'] = acl
-                self.get_s3_resource().Object(self.bucket_name, filepath).put(**kwargs)
-            except ClientError as e:
-                if e.response['Error']['Code'] == 'AccessControlListNotSupported':
-                    # Retry without ACL for buckets with enforced ownership
-                    del kwargs['ACL']
-                    self.get_s3_resource().Object(self.bucket_name, filepath).put(**kwargs)
-                else:
-                    raise e
 
             if mime_type != 'application/pdf':
                 filename = filepath.split('/')[-1]
                 kwargs['ContentDisposition'] = 'attachment; filename=' + filename
             if extra_metadata:
                 kwargs['Metadata'] = extra_metadata
+                
+            # Only add ACL if bucket supports it
+            if self._supports_acl:
+                kwargs['ACL'] = acl
 
+            self.get_s3_resource().Object(self.bucket_name, filepath).put(**kwargs)
             log.info("Successfully uploaded %s to S3!", filepath)
-            self.redis.delete(filepath)
-            self.redis.delete(filepath + VISIBILITY_CACHE_PATH + '/all')
-            self.redis.put(filepath + VISIBILITY_CACHE_PATH, acl, expiry=self.acl_cache_window)
+            
+            # Update cache only if we're tracking ACLs
+            if self._supports_acl:
+                self.redis.delete(filepath)
+                self.redis.delete(filepath + VISIBILITY_CACHE_PATH + '/all')
+                self.redis.put(filepath + VISIBILITY_CACHE_PATH, acl, expiry=self.acl_cache_window)
+                
         except Exception as e:
             log.error('Something went very very wrong when uploading to [%s]: %s', filepath, e)
             raise e

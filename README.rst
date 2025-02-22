@@ -92,10 +92,43 @@ Optional::
 
     # An optional setting to control whether to check for ACL support on the bucket.
     # When set to false, the system will default to bucket owner enforced mode
-    # and not attempt to set ACLs on objects. This is recommended when using
-    # buckets with Object Ownership set to 'Bucket owner enforced'.
+    # and not attempt to set ACLs on objects. This is recommended when using:
+    # - Buckets with Object Ownership set to 'Bucket owner enforced'
+    # - IAM roles without s3:GetBucketAcl permission
+    # - When you want to rely solely on bucket policies for access control
     # Default is true (for backward compatibility).
     ckanext.s3filestore.check_access_control_list = false
+
+    # Required IAM Permissions when check_access_control_list = true:
+    # - s3:GetBucketAcl
+    # - s3:PutObjectAcl
+    # - s3:GetObjectAcl
+    #
+    # Minimum IAM Permissions when check_access_control_list = false:
+    # - s3:PutObject
+    # - s3:GetObject
+    # - s3:DeleteObject
+    # - s3:ListBucket
+    #
+    # Example IAM Policy for check_access_control_list = false:
+    # {
+    #     "Version": "2012-10-17",
+    #     "Statement": [
+    #         {
+    #             "Effect": "Allow",
+    #             "Action": [
+    #                 "s3:PutObject",
+    #                 "s3:GetObject",
+    #                 "s3:DeleteObject",
+    #                 "s3:ListBucket"
+    #             ],
+    #             "Resource": [
+    #                 "arn:aws:s3:::your-bucket-name/*",
+    #                 "arn:aws:s3:::your-bucket-name"
+    #             ]
+    #         }
+    #     ]
+    # }
 
     # An optional setting to change the ACL of files previously uploaded
     # for the resource under different names.

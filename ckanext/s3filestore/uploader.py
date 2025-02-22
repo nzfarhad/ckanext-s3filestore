@@ -125,9 +125,14 @@ class BaseS3Uploader(object):
                 self._supports_acl = True
                 log.debug("S3 bucket '%s' supports ACLs", self.bucket_name)
             except ClientError as e:
-                if e.response['Error']['Code'] == 'AccessControlListNotSupported':
+                error_code = e.response['Error']['Code']
+                if error_code == 'AccessControlListNotSupported':
                     self._supports_acl = False
                     log.info("S3 bucket '%s' has Object Ownership set to 'Bucket owner enforced' - ACLs disabled", self.bucket_name)
+                elif error_code == 'AccessDenied':
+                    # If we don't have permission to check ACL, assume ACLs are not supported
+                    self._supports_acl = False
+                    log.warning("No permission to check ACL support on bucket '%s' - defaulting to bucket owner enforced mode", self.bucket_name)
                 else:
                     # Other errors should be raised
                     raise

@@ -185,15 +185,28 @@ class BaseS3Uploader(object):
 
         try:
             kwargs = {
-                'Body': upload_file.read(), 'ACL': acl,
-                'ContentType': mime_type}
+                'Body': upload_file.read(),
+                'ContentType': mime_type
+            }
+            
+            # Only add ACL if not using bucket owner enforced
+            try:
+                kwargs['ACL'] = acl
+                self.get_s3_resource().Object(self.bucket_name, filepath).put(**kwargs)
+            except ClientError as e:
+                if e.response['Error']['Code'] == 'AccessControlListNotSupported':
+                    # Retry without ACL for buckets with enforced ownership
+                    del kwargs['ACL']
+                    self.get_s3_resource().Object(self.bucket_name, filepath).put(**kwargs)
+                else:
+                    raise e
+
             if mime_type != 'application/pdf':
                 filename = filepath.split('/')[-1]
                 kwargs['ContentDisposition'] = 'attachment; filename=' + filename
             if extra_metadata:
                 kwargs['Metadata'] = extra_metadata
 
-            self.get_s3_resource().Object(self.bucket_name, filepath).put(**kwargs)
             log.info("Successfully uploaded %s to S3!", filepath)
             self.redis.delete(filepath)
             self.redis.delete(filepath + VISIBILITY_CACHE_PATH + '/all')

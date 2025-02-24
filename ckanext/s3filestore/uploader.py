@@ -404,6 +404,13 @@ class S3Uploader(BaseS3Uploader):
 
         if not self.storage_path:
             return
+
+        # Handle case where upload_field_storage is None (e.g., during user invite)
+        if self.upload_field_storage is None:
+            if self.clear and self.url == self.old_filename:
+                data_dict[url_field] = ''
+            return
+
         if isinstance(self.upload_field_storage, ALLOWED_UPLOAD_TYPES) \
                 and self.upload_field_storage.filename:
             self.filename = self.upload_field_storage.filename
